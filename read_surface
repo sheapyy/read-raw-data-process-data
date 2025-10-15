@@ -1,0 +1,193 @@
+%% 读取当前路径下所有全球netcdf数据，分离晴天和有云数据
+clc
+clear all
+tic
+%列序号	变量名	含义描述	单位
+% 1	time	时间（时间戳）	时间单位d
+% 2	lon	经度（已转换为0-360度范围）	度
+% 3	lat	纬度	度
+% 4	t2mData	2米高度气温	K
+% 5	d2mData	2米高度露点温度	K
+% 6	spData	地表气压	Pa
+% 7	sktData	地表皮肤温度	K
+% 8	u10Data	10米高度U风速（东西方向分量）	m/s
+% 9	v10Data	10米高度V风速（南北方向分量）	m/s
+% 10	Lsmask	陆地-海洋掩码（0=海洋，1=陆地）	无
+% 11	siconc	海冰覆盖率	% (0-1)
+% 12	tciw	total column cloud ice water	kg/m²
+% 13	clData	湖泊覆盖率	% (0-1)
+% 14	rsnData	雪密度	kg/m³
+% 15	tccData	total cloud liquid water	kg/m²
+
+%% 设置数据路径
+namepath = 'E:\data\ec\surface\30-50_110-130\4-6_cloud_cover';
+
+%% 获取所有.nc文件列表
+file_list = dir(fullfile(namepath, '*.nc'));
+num_files = length(file_list);
+
+%% 检查是否有.nc文件
+if num_files == 0
+    error('未找到任何.nc文件！请检查路径：%s', namepath);
+end
+
+%% 循环处理每个.nc文件
+for file_idx = 1:num_files
+    %% 获取当前文件名
+    current_name = file_list(file_idx).name;
+    file_name = fullfile(namepath, current_name);
+    fprintf('\n开始处理文件 %d/%d: %s\n', file_idx, num_files, current_name);
+    
+    %% 读取数据
+    lon = double(ncread(file_name, 'longitude'));    % 读入经度
+    lon(lon < 0) = lon(lon < 0) + 360;              % 经度转换[0-360]
+    lat = double(ncread(file_name, 'latitude'));     % 读入纬度
+    time = double(ncread(file_name, 'valid_time'));  % 读入时间
+    
+    % 读取所有变量数据
+    u10Data  = double(ncread(file_name, 'u10'));     % 10m风速
+    v10Data  = double(ncread(file_name, 'v10'));     % 变量v10
+    d2mData  = double(ncread(file_name, 'd2m'));     % 2m湿度
+    t2mData  = double(ncread(file_name, 't2m'));     % 2m温度
+    clData   = double(ncread(file_name, 'cl'));      % Lake cover
+    Lsmask   = double(ncread(file_name, 'lsm'));     % Land-sea mask
+    siconc   = double(ncread(file_name, 'siconc'));  % sea_ice_area_fraction
+    sktData  = double(ncread(file_name, 'skt'));     % 表面裸露温度
+    rsnData  = double(ncread(file_name, 'rsn'));     % Snow density
+    spData   = double(ncread(file_name, 'sp'));      % 表面压强
+    tciwData = double(ncread(file_name, 'tciw'));    % Total column cloud ice water
+    tccData = double(ncread(file_name, 'tcc'));    % Total column cloud liquid water
+    
+    
+    %% 检查数据维度
+    lon_length = length(lon);
+    lat_length = length(lat);
+    time_length = length(time);
+    
+    fprintf('数据维度: 经度=%d, 纬度=%d, 时间=%d\n', lon_length, lat_length, time_length);
+    
+    %% 数据分段处理设置
+    all_sunny_data = [];   % 初始化晴天数据存储矩阵
+    all_cloudy_data = [];  % 初始化有云数据存储矩阵
+    
+    % 设置分段大小（根据内存调整）
+    segment_size = 20;
+    num_segments = ceil(lon_length / segment_size);
+    
+    %% 分段处理数据
+    for seg = 1:num_segments
+        % 计算当前段范围
+        start_idx = (seg - 1) * segment_size + 1;
+        end_idx = min(seg * segment_size, lon_length);
+        
+        fprintf('  处理经度段 %d/%d: %d-%d\n', seg, num_segments, start_idx, end_idx);
+        
+        % 初始化当前段数据
+        segment_sunny = [];   % 当前段晴天数据
+        segment_cloudy = [];  % 当前段有云数据
+        
+        % 提取当前段数据
+        for i = start_idx:end_idx
+            for j = 1:lat_length
+                for m = 1:time_length
+                    % 获取当前点的tcc值
+                    current_tcc = tccData(i, j, m);
+                    
+                    % 过滤掉小于0的数据j
+                    if current_tcc < 0
+                        continue;  % 跳过这个数据点
+                    end
+                    
+                    % 构建数据行
+                    data_row = [...
+                        time(m), ...
+                        lon(i), ...
+                        lat(j), ...
+                        t2mData(i, j, m), ...
+                        d2mData(i, j, m), ...
+                        spData(i, j, m), ...
+                        sktData(i, j, m), ...
+                        u10Data(i, j, m), ...
+                        v10Data(i, j, m), ...
+                        Lsmask(i, j, m), ...
+                        siconc(i, j, m), ...
+                        tciwData(i, j, m), ...
+                        clData(i, j, m), ...
+                        rsnData(i, j, m), ...
+                        current_tcc ...
+                    ];
+                    
+                    % 根据tcc值分类数据
+                    if current_tcc == 0
+                        % 晴天数据 (tcc == )
+                        segment_sunny = [segment_sunny; data_row];
+                    else
+                        % 有云数据 (tcc > 0)
+                        segment_cloudy = [segment_cloudy; data_row];
+                    end
+                end
+            end
+        end
+        
+        % 将当前段添加到总数据
+        all_sunny_data = [all_sunny_data; segment_sunny];
+        all_cloudy_data = [all_cloudy_data; segment_cloudy];
+    end
+    
+    %% 创建保存目录
+    save_dir = 'E:\data\ec\surface\30-50_110-130\4-6_cloud_cover\processed';
+    if ~exist(save_dir, 'dir')
+        mkdir(save_dir);
+        fprintf('创建目录: %s\n', save_dir);
+    end
+    
+    %% 生成文件名（从原文件名提取日期信息）
+    [~, basename] = fileparts(current_name);
+    
+    % 尝试从文件名中提取日期信息，如果没有则使用文件名
+    date_pattern = '\d{8}';  % 匹配8位数字的日期格式
+    date_match = regexp(basename, date_pattern, 'match');
+    
+    if ~isempty(date_match)
+        date_str = date_match{1};  % 使用第一个匹配的日期
+    else
+        % 如果没有找到日期格式，使用文件名或默认日期
+        date_str = basename;
+    end
+    
+    %% 保存晴天数据
+    if ~isempty(all_sunny_data)
+        sunny_filename = [date_str '_sun.mat'];
+        sunny_path = fullfile(save_dir, sunny_filename);
+        data_ecmwf_surface = all_sunny_data;
+        save(sunny_path, 'data_ecmwf_surface');
+        fprintf('保存晴天数据: %s (尺寸: %s)\n', sunny_filename, mat2str(size(data_ecmwf_surface)));
+    else
+        fprintf('警告: 文件 %s 中没有晴天数据\n', current_name);
+    end
+    
+    %% 保存有云数据
+    if ~isempty(all_cloudy_data)
+        cloudy_filename = [date_str '_cloudy.mat'];
+        cloudy_path = fullfile(save_dir, cloudy_filename);
+        data_ecmwf_surface = all_cloudy_data;
+        save(cloudy_path, 'data_ecmwf_surface');
+        fprintf('保存有云数据: %s (尺寸: %s)\n', cloudy_filename, mat2str(size(data_ecmwf_surface)));
+    else
+        fprintf('警告: 文件 %s 中没有有云数据\n', current_name);
+    end
+    
+    %% 打印统计信息
+    fprintf('文件 %s 处理完成:\n', current_name);
+    fprintf('  - 晴天数据点: %d\n', size(all_sunny_data, 1));
+    fprintf('  - 有云数据点: %d\n', size(all_cloudy_data, 1));
+    fprintf('  - 总有效数据点: %d\n', size(all_sunny_data, 1) + size(all_cloudy_data, 1));
+    
+    %% 清理当前文件变量释放内存
+    clear lon lat time u10Data v10Data d2mData t2mData clData ...
+          Lsmask siconc sktData rsnData spData tciwData tccData ...
+          segment_sunny segment_cloudy all_sunny_data all_cloudy_data data_ecmwf_surface
+end
+
+toc
+fprintf('所有文件处理完成!\n');
