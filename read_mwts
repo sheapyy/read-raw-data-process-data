@@ -1,0 +1,149 @@
+clc
+clear all
+tic
+%%最后读取到的结构体中，1-6列年月日时分秒，7从当月第一天开始的绝对时间戳
+%%8，1-总扫描数，9像元1-98 10，11传感器天顶角，传感器方位角，12，13太阳的天顶角方位角
+%%14，15经度维度 16土地覆盖类型 17海陆掩码分类 18 占位符 19-35 17个通道的亮温值36 索引
+%%
+%%
+%% 设置日期范围
+start_date = datenum('2025-06-29');
+end_date = datenum('2025-06-30');
+
+%% 获取文件名
+parent_folder = 'E:\data\fy\30-50_110-130_mwts\4-6';
+folders = dir(parent_folder);
+folders = folders(3:end); % 去除 '.' 和 '..' 文件夹
+
+for folder_idx = 1:length(folders)
+    current_folder = folders(folder_idx).name;
+    current_date = datenum(current_folder, 'yyyymmdd');
+    
+    % 检查当前文件夹是否在日期范围内
+    if current_date >= start_date && current_date <= end_date
+        current_path = fullfile(parent_folder, current_folder);
+        
+        name = 'FY3E_MWTS-_ORBA_L1_202*.HDF';
+        nameall = dir(fullfile(current_path, name));
+        
+        if isempty(nameall)
+            disp(['No files found in ', current_path]);
+            break;
+        end
+        
+        % 用cell数组存储完整文件路径
+        file_name = cell(size(nameall));
+        for jj = 1:numel(nameall)
+            file_name{jj} = fullfile(current_path, nameall(jj).name);
+        end
+        
+        for ii = 1:numel(file_name)
+            disp(['Processing file: ', file_name{ii}]);
+            
+            data = [];
+            % 读取Data层
+            bt = double(h5read(file_name{ii}, '/Data/Earth_Obs_BT')); % 亮温 (98x604x17)
+            % 需要转换单位：原始数据乘以0.01得到K，根据属性显示slope=0.01
+            bt = bt * 0.01; % 转换为开尔文
+
+            % 读取地理信息Geolocation层
+            landcover = double(h5read(file_name{ii},'/Geolocation/LandCover')); % (98x604)
+            landseamask = double(h5read(file_name{ii},'/Geolocation/LandSeaMask')); % (98x604)
+            longitude = double(h5read(file_name{ii},'/Geolocation/Longitude')); % (98x604)
+%             longitude((longitude<0)) = longitude((longitude<0)) + 360.0;%经度
+            latitude = double(h5read(file_name{ii},'/Geolocation/Latitude')); % (98x604)
+            scnlin_mscnt = double(h5read(file_name{ii},'/Geolocation/Scnlin_mscnt')); % (604,)
+            saomiaoxian = size(scnlin_mscnt,1); % 扫描线数量
+            
+            % 读取角度信息，需要应用缩放因子0.01
+            sensorzenith = double(h5read(file_name{ii},'/Geolocation/SensorZenith')) * 0.01; % (98x604)
+            sensorazimuth = double(h5read(file_name{ii},'/Geolocation/SensorAzimuth')) * 0.01; % (98x604)
+            sensorazimuth((sensorazimuth<0)) = sensorazimuth((sensorazimuth<0)) + 360.0;
+            solarzenith = double(h5read(file_name{ii},'/Geolocation/SolarZenith')) * 0.01; % (98x604)
+            solarazimuth = double(h5read(file_name{ii},'/Geolocation/SolarAzimuth')) * 0.01; % (98x604)
+            solarazimuth((solarazimuth<0)) = solarazimuth((solarazimuth<0)) + 360.0;
+
+            % 读取属性层
+            year_month_day = h5readatt(file_name{ii},'/','Observing Beginning Date');
+            begin_time = h5readatt(file_name{ii},'/','Observing Beginning Time');
+
+            % 读取数据 - MWTS有98个像元
+            temp_data = [];
+            for kk = 1:78  % MWTS有98个像元
+                for sl = 1:saomiaoxian
+                    % 计算时间
+                    year = str2double(year_month_day(1:4));
+                    month = str2double(year_month_day(6:7));
+                    day = str2double(year_month_day(9:10));
+                    hour = str2double(begin_time(1:2));
+                    minute = str2double(begin_time(4:5));
+                    second = str2double(begin_time(7:8));
+                    begin_time_miao = (day-1)*86400 + hour*3600 + minute*60 + second;
+                    
+                    % 处理跨天的情况
+                    if (scnlin_mscnt(sl) >= scnlin_mscnt(1))
+                        time_miao = begin_time_miao + (scnlin_mscnt(sl)-scnlin_mscnt(1))/1000.00;
+                    else
+                        time_miao = begin_time_miao + (scnlin_mscnt(sl) + 86400000 - scnlin_mscnt(1))/1000.00;
+                    end
+                    
+                    xiangyuan = kk;
+                    % MWTS有17个通道的亮温数据
+                    temp_data = [temp_data; year month day hour minute second time_miao sl xiangyuan ...
+                        sensorzenith(kk,sl) sensorazimuth(kk,sl) solarzenith(kk,sl) solarazimuth(kk,sl) ...
+                        longitude(kk,sl) latitude(kk,sl) landcover(kk,sl) landseamask(kk,sl) 0 ...
+                        squeeze(bt(kk,sl,:))'];  % 17个通道的亮温值
+                end
+            end
+
+            data = [data; temp_data];
+            
+            % 限制亮温范围 - 对17个通道（19-35列）进行检查
+            [hang, ~] = find(data(:, 19:35) < 100 | data(:, 19:35) > 350);
+            data(hang, :) = [];
+            
+            % 在data中添加一列，数据从1开始递增
+            data = [data, (1:size(data, 1))'];
+
+            % 根据landseamask判断不同类型
+            land_data = data(~isnan(data(:, 17)) & data(:, 17) == 1, :); % 1 表示陆地
+            land_water_data = data(~isnan(data(:, 17)) & data(:, 17) == 2, :); % 2 表示陆地水
+            ocean_data = data(~isnan(data(:, 17)) & data(:, 17) == 3, :); % 3 表示海洋
+            boundary_data = data(~isnan(data(:, 17)) & data(:, 17) == 5, :); % 5 表示分界线
+
+            if ~isempty(data) || ~isempty(land_data) || ~isempty(land_water_data) || ~isempty(ocean_data) || ~isempty(boundary_data)
+                [~, fname, ~] = fileparts(file_name{ii});
+                date_tokens = regexp(fname, '\d{8}', 'match');
+                if isempty(date_tokens)
+                    error('Cannot extract date from filename!');
+                end
+                date_str = date_tokens{1};
+                save_path = fullfile(parent_folder, ['processed', date_str]);
+                if ~exist(save_path, 'dir')
+                    mkdir(save_path);
+                end
+                
+                save_name_land = fullfile(save_path, [fname, '_land.mat']);
+                save_name_land_water = fullfile(save_path, [fname, '_land_water.mat']);
+                save_name_ocean = fullfile(save_path, [fname, '_ocean.mat']);
+                save_name_boundary = fullfile(save_path, [fname, '_boundary.mat']);
+                save_name_data = fullfile(save_path, [fname, '.mat']);
+
+                if ~isempty(land_data)
+                    save(save_name_land, 'land_data', '-v7.3');
+                end
+                if ~isempty(land_water_data)
+                    save(save_name_land_water, 'land_water_data', '-v7.3');
+                end
+                if ~isempty(ocean_data)
+                    save(save_name_ocean, 'ocean_data', '-v7.3');
+                end
+                if ~isempty(boundary_data)
+                    save(save_name_boundary, 'boundary_data', '-v7.3');
+                end
+                save(save_name_data, 'data', '-v7.3');
+            end
+        end
+    end
+end
+toc
