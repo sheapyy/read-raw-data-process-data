@@ -1,0 +1,211 @@
+clc
+clear all
+tic
+
+%% 日期范围设置
+start_date = '20250501';
+end_date = '20250630';
+date_list = datenum(start_date, 'yyyymmdd'):datenum(end_date, 'yyyymmdd');
+date_list = datestr(date_list, 'yyyymmdd');
+
+%% 主循环处理每天数据
+for d_idx = 1:size(date_list, 1)
+    date_str = strtrim(date_list(d_idx, :));  % 当前日期
+    
+    %% ========== 1. 读取当天的ECMWF pressure数据 ==========
+    ec_pressure_file = fullfile('E:\data\ec\pressure\30-50_110-130\4-6\', ...
+                                [date_str, '.mat']);
+    
+    % 检查pressure文件是否存在
+    if ~exist(ec_pressure_file, 'file')
+        warning('ECMWF pressure data missing for date: %s', date_str);
+        continue;
+    end
+    
+    % 加载ECMWF pressure数据（一天的数据）
+    ec_pressure_data = load(ec_pressure_file);
+    ec_pressure = ec_pressure_data.data_ecmwf_pressure;
+    
+    fprintf('加载 %s 的ECMWF数据: %d x %d\n', date_str, size(ec_pressure, 1), size(ec_pressure, 2));
+    
+    %% ========== 2. 读取当天的所有MWTS文件 ==========
+    mwts_path = 'E:\data\fy\30-50_110-130_mwts\4-6\boundary_sun';
+    
+    % 查找当天的所有MWTS文件（文件名以当天日期开头）
+    mwts_pattern = [date_str, '_*_mwts.mat'];
+    mwts_files = dir(fullfile(mwts_path, mwts_pattern));
+    
+    % 如果没有找到特定格式的文件，尝试更通用的搜索
+    if isempty(mwts_files)
+        all_mwts_files = dir(fullfile(mwts_path, '*.mat'));
+        mwts_files = [];
+        for i = 1:length(all_mwts_files)
+            % 检查文件名是否包含当天日期
+            if contains(all_mwts_files(i).name, date_str)
+                mwts_files(end+1) = all_mwts_files(i);
+            end
+        end
+    end
+    
+    % 检查有效文件
+    if isempty(mwts_files)
+        warning('未找到当天的MWTS文件: %s', date_str);
+        continue;
+    end
+    
+    fprintf('找到 %d 个MWTS文件用于日期 %s\n', length(mwts_files), date_str);
+    
+    % 预计算ECMWF pressure数据的信息（避免重复计算）
+    ec_times = ec_pressure(:, 1);
+    ec_lons = ec_pressure(:, 2);  % 经度
+    ec_lats = ec_pressure(:, 3);  % 纬度
+    
+    %% ========== 3. 处理每个时间点的MWTS文件 ==========
+    for f_idx = 1:length(mwts_files)
+        fname = mwts_files(f_idx).name;
+        
+        % 从文件名提取时间信息
+        fname_parts = split(fname, '_');
+        if length(fname_parts) >= 2
+            time_str = fname_parts{2}; % 例如：从 "20250401_0820_mwts.mat" 提取 "0820"
+        else
+            fprintf('文件名格式不正确，跳过: %s\n', fname);
+            continue;
+        end
+        
+        % 加载当前MWTS文件
+        mwts_file_data = load(fullfile(mwts_path, fname));
+        
+        % 检查数据字段名
+        if isfield(mwts_file_data, 'matched_data')
+            mwts_data = mwts_file_data.matched_data;
+        elseif isfield(mwts_file_data, 'data_match_btd')
+            mwts_data = mwts_file_data.data_match_btd;
+        else
+            % 尝试其他可能的字段名
+            field_names = fieldnames(mwts_file_data);
+            mwts_data = [];
+            for j = 1:length(field_names)
+                if isnumeric(mwts_file_data.(field_names{j})) && ...
+                   size(mwts_file_data.(field_names{j}), 2) >= 15
+                    mwts_data = mwts_file_data.(field_names{j});
+                    break;
+                end
+            end
+        end
+        
+        % 检查数据是否成功加载
+        if isempty(mwts_data)
+            fprintf('MWTS数据加载失败: %s\n', fname);
+            continue;
+        end
+        
+        fprintf('\n处理文件: %s (时间: %s)\n', fname, time_str);
+        fprintf('MWTS数据维度: %d x %d\n', size(mwts_data, 1), size(mwts_data, 2));
+        
+        %% ========== 4. 时空匹配 ==========
+        bt_index = [];
+        ec_index = [];
+        
+        % 统计计数器
+        valid_mwts_count = 0;
+        time_parse_fail_count = 0;
+        location_invalid_count = 0;
+        matched_count = 0;
+        
+        for ii = 1:size(mwts_data, 1)
+            % 检查经纬度有效性（仅限北纬，东经）
+            if mwts_data(ii, 15) <= 0 || mwts_data(ii, 14) <= 0
+                location_invalid_count = location_invalid_count + 1;
+                continue;
+            end
+            
+            % 解析MWTS时间
+            try
+                if size(mwts_data, 2) >= 7 && ~isnan(mwts_data(ii, 7))
+                    mwts_time_temp = datetime(mwts_data(ii,1), mwts_data(ii,2), mwts_data(ii,3), ...
+                                              mwts_data(ii,4), mwts_data(ii,5), mwts_data(ii,6) + mwts_data(ii,7)/1000);
+                else
+                    mwts_time_temp = datetime(mwts_data(ii,1), mwts_data(ii,2), mwts_data(ii,3), ...
+                                              mwts_data(ii,4), mwts_data(ii,5), mwts_data(ii,6));
+                end
+                mwts_posix_time = posixtime(mwts_time_temp);
+                valid_mwts_count = valid_mwts_count + 1;
+            catch
+                time_parse_fail_count = time_parse_fail_count + 1;
+                continue;
+            end
+            
+            % 计算与所有ECMWF点的差异
+            time_diffs = abs(mwts_posix_time - ec_times);
+            lat_diffs = abs(ec_lats - mwts_data(ii, 15));
+            lon_diffs = abs(ec_lons - mwts_data(ii, 14));
+            
+            % 匹配条件：时间差<=30分钟，经纬度差<=0.1度
+            time_threshold = 1800;  % 30分钟
+            lat_threshold = 0.1;    % 0.1度
+            lon_threshold = 0.1;    % 0.1度
+            
+            valid_idx = find(time_diffs <= time_threshold & ...
+                           lat_diffs <= lat_threshold & ...
+                           lon_diffs <= lon_threshold);
+            
+            if ~isempty(valid_idx)
+                % 多匹配时取最小综合距离
+                if numel(valid_idx) > 1
+                    % 归一化权重：时间权重/空间权重
+                    normalized_time = time_diffs(valid_idx) / 1800;  % 归一化到0-1
+                    normalized_space = (lat_diffs(valid_idx) + lon_diffs(valid_idx)) / 0.2; % 归一化到0-1
+                    total_distance = normalized_time + normalized_space;
+                    [~, min_idx] = min(total_distance);
+                    best_match = valid_idx(min_idx);
+                else
+                    best_match = valid_idx(1);
+                end
+                
+                bt_index(end+1) = ii;
+                ec_index(end+1) = best_match;
+                matched_count = matched_count + 1;
+            end
+        end
+        
+        % 输出统计信息
+        fprintf('匹配统计:\n');
+        fprintf('  总MWTS点数: %d\n', size(mwts_data, 1));
+        fprintf('  经纬度有效: %d\n', size(mwts_data, 1) - location_invalid_count);
+        fprintf('  时间解析成功: %d\n', valid_mwts_count);
+        fprintf('  时间解析失败: %d\n', time_parse_fail_count);
+        fprintf('  成功匹配: %d\n', matched_count);
+        
+        %% ========== 5. 保存匹配结果 ==========
+        if ~isempty(bt_index)
+            % 创建存储目录
+            save_dir_bt = 'E:\data\fy\30-50_110-130_mwts\4-6\boundary_sun\matched_with_pressure';
+            save_dir_p = 'E:\data\fy\30-50_110-130_mwts\4-6\boundary_sun\pressure';
+            
+            if ~isfolder(save_dir_bt), mkdir(save_dir_bt); end
+            if ~isfolder(save_dir_p), mkdir(save_dir_p); end
+     
+            % 构建文件名（保持原有格式）
+            [~, base_name, ~] = fileparts(fname);
+            
+            % 保存匹配数据
+            data_match_btd = mwts_data(bt_index, :);
+            save(fullfile(save_dir_bt, [base_name, '.mat']), 'data_match_btd');
+         
+            data_match_p = ec_pressure(ec_index, :);
+            save(fullfile(save_dir_p, [base_name, '_pressure.mat']), 'data_match_p');
+            
+            fprintf('保存成功: %s\n', base_name);
+        else
+            fprintf('无匹配点，跳过保存\n');
+        end
+        
+        fprintf('Processed %s %s: Matched %d points\n', date_str, time_str, length(bt_index));
+    end
+    
+    fprintf('\n完成日期 %s 的处理\n', date_str);
+end
+
+fprintf('\n所有数据处理完成！\n');
+toc
