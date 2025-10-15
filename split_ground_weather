@@ -1,0 +1,301 @@
+clc
+clear all
+tic
+%%要改的地方，boundary,boundary,cloudy,sudn,mwhs/mwts
+%% 日期范围设置
+start_date = '20250501';
+end_date = '20250630';
+date_list = datenum(start_date, 'yyyymmdd'):datenum(end_date, 'yyyymmdd');
+date_list = datestr(date_list, 'yyyymmdd');
+
+% 调试选项
+debug_mode = false;  % 设为false关闭详细调试
+sample_debug = false; % 只对部分数据进行详细调试
+debug_sample_size = 10; % 调试样本大小
+
+%% 主循环处理每天数据
+for d_idx = 1:size(date_list, 1)
+    date_str = strtrim(date_list(d_idx, :));  % 当前日期
+    surface_date = date_str(1:6);  % ECMWF月份目录
+    
+    fprintf('\n========== 处理日期: %s ==========\n', date_str);
+    
+    %% ========== 1. 读取MWHS卫星数据 ==========
+    mwhs_dir = fullfile('E:\data\fy\30-50_110-130_mwhs\up\4-6', ...
+                        ['processed', date_str]);
+    
+    % 获取当天所有MWHS文件 (仅匹配标准命名格式)
+    all_mwhs_files = dir(fullfile(mwhs_dir, 'FY3E_MWHS-_ORBA_L1_*.mat'));
+    
+    % 优化：使用cellfun过滤文件
+    file_names = {all_mwhs_files.name};
+    pattern = '^FY3E_MWHS-_ORBA_L1_\d{8}_\d{4}_015KM_V0_boundary\.mat$';
+    valid_mask = ~cellfun(@isempty, regexp(file_names, pattern, 'once'));
+    valid_files = file_names(valid_mask);
+    
+    % 检查有效文件
+    if isempty(valid_files)
+        warning('未在当前路径下找到文件: %s', date_str);
+        continue;
+    end
+    
+    fprintf('找到 %d 个有效MWHS文件\n', length(valid_files));
+    
+    %% ========== 2. 读取ec数据 ==========
+    % 压力层数据
+    surface_file = fullfile('E:\data\ec\surface\30-50_110-130\4-6_cloud_cover\processed\cloudy\', ...
+                                [date_str,'_cloudy', '.mat']);
+   
+    % 检查文件是否存在
+    if ~exist(surface_file, 'file') 
+        warning('ECMWF data missing for date: %s', date_str);
+        continue;
+    end
+    
+    % 加载ECMWF数据
+    surface = load(surface_file);
+    surface = surface.data_ecmwf_surface;
+    
+    fprintf('surface数据加载完成: %d 行\n', size(surface, 1));
+    
+    % 优化：预处理surface数据，创建索引
+    surface_times = surface(:, 1);
+    surface_lats = surface(:, 3);
+    surface_lons = surface(:, 2);
+    
+    % 创建空间索引网格(加速空间查询)
+    lat_min = min(surface_lats); lat_max = max(surface_lats);
+    lon_min = min(surface_lons); lon_max = max(surface_lons);
+    grid_size = 0.2; % 网格大小，比匹配阈值稍大
+    lat_bins = lat_min:grid_size:lat_max+grid_size;
+    lon_bins = lon_min:grid_size:lon_max+grid_size;
+    
+    % 将surface点分配到网格中
+    [~, lat_bin_idx] = histc(surface_lats, lat_bins);
+    [~, lon_bin_idx] = histc(surface_lons, lon_bins);
+    
+    % 创建网格索引map
+    grid_map = containers.Map();
+    for i = 1:length(surface_times)
+        key = sprintf('%d_%d', lat_bin_idx(i), lon_bin_idx(i));
+        if isKey(grid_map, key)
+            grid_map(key) = [grid_map(key), i];
+        else
+            grid_map(key) = i;
+        end
+    end
+    
+    %% ========== 3. 处理每个时间点的MWHS文件 ==========
+    for f_idx = 1:length(valid_files)
+        fname = valid_files{f_idx};
+        fprintf('\n--- 处理文件: %s ---\n', fname);
+        
+        % 加载当前MWHS文件
+        mwhs_data = load(fullfile(mwhs_dir, fname));
+        mwhs_data = mwhs_data.boundary_data;
+        
+        % 从文件名提取时间标识 (e.g., '0740')
+        time_str = fname(29:32);  % 文件名位置29-32为时间
+        
+        fprintf('MWHS数据量: %d 行\n', size(mwhs_data, 1));
+        
+        % 优化：预过滤MWHS数据
+        valid_mwhs_mask = mwhs_data(:, 15) > 0 & mwhs_data(:, 14) > 0;
+        valid_mwhs_data = mwhs_data(valid_mwhs_mask, :);
+        valid_indices = find(valid_mwhs_mask);
+        
+        if isempty(valid_mwhs_data)
+            fprintf('没有满足条件的MWHS数据\n');
+            continue;
+        end
+        
+        % MWHS数据统计信息
+        if debug_mode
+            fprintf('满足北纬东经条件的MWHS数据: %d / %d (%.1f%%)\n', ...
+                size(valid_mwhs_data, 1), size(mwhs_data, 1), 100*size(valid_mwhs_data, 1)/size(mwhs_data, 1));
+            
+            mwhs_lat_range = [min(valid_mwhs_data(:, 15)), max(valid_mwhs_data(:, 15))];
+            mwhs_lon_range = [min(valid_mwhs_data(:, 14)), max(valid_mwhs_data(:, 14))];
+            fprintf('MWHS纬度范围: %.2f 到 %.2f\n', mwhs_lat_range(1), mwhs_lat_range(2));
+            fprintf('MWHS经度范围: %.2f 到 %.2f\n', mwhs_lon_range(1), mwhs_lon_range(2));
+        end
+        
+        %% 优化：批量计算MWHS时间
+        mwhs_times = NaN(size(valid_mwhs_data, 1), 1);
+        valid_time_mask = true(size(valid_mwhs_data, 1), 1);
+        
+        for i = 1:size(valid_mwhs_data, 1)
+            try
+                fy3e_time_temp = datetime(valid_mwhs_data(i,1), valid_mwhs_data(i,2), valid_mwhs_data(i,3), ...
+                                         valid_mwhs_data(i,4), valid_mwhs_data(i,5), ...
+                                         valid_mwhs_data(i,6) + valid_mwhs_data(i,7)/1000);
+                mwhs_times(i) = posixtime(fy3e_time_temp);
+            catch
+                valid_time_mask(i) = false;
+                if debug_mode
+                    fprintf('  警告: MWHS第%d行时间转换失败\n', valid_indices(i));
+                end
+            end
+        end
+        
+        % 过滤掉时间转换失败的数据
+        valid_mwhs_data = valid_mwhs_data(valid_time_mask, :);
+        mwhs_times = mwhs_times(valid_time_mask);
+        valid_indices = valid_indices(valid_time_mask);
+        
+        if isempty(valid_mwhs_data)
+            fprintf('没有时间转换成功的MWHS数据\n');
+            continue;
+        end
+        
+        %% 优化：向量化时间匹配
+        bt_index = [];
+        surface_index = [];
+        
+        % 匹配统计
+        time_match_count = 0;
+        space_match_count = 0;
+        debug_counter = 0;
+        
+        % 预分配内存
+        max_matches = min(size(valid_mwhs_data, 1), size(surface, 1));
+        temp_bt_idx = zeros(max_matches, 1);
+        temp_surface_idx = zeros(max_matches, 1);
+        match_count = 0;
+        
+        for ii = 1:size(valid_mwhs_data, 1)
+            mwhs_lat = abs(valid_mwhs_data(ii, 15));
+            mwhs_lon = abs(valid_mwhs_data(ii, 14));
+            mwhs_time = mwhs_times(ii);
+            
+            % 优化：使用向量化操作进行时间匹配
+            time_diff = abs(surface_times - mwhs_time);
+            time_matched_idx = find(time_diff <= 1800);  % 30分钟
+            
+            if ~isempty(time_matched_idx)
+                time_match_count = time_match_count + 1;
+                
+                % 优化：使用网格索引加速空间查询
+                % 计算MWHS点所在的网格
+                mwhs_lat_bin = max(1, min(length(lat_bins)-1, floor((mwhs_lat - lat_min)/grid_size) + 1));
+                mwhs_lon_bin = max(1, min(length(lon_bins)-1, floor((mwhs_lon - lon_min)/grid_size) + 1));
+                
+                % 搜索当前网格及相邻网格
+                candidate_indices = [];
+                for dlat = -1:1
+                    for dlon = -1:1
+                        search_lat_bin = mwhs_lat_bin + dlat;
+                        search_lon_bin = mwhs_lon_bin + dlon;
+                        if search_lat_bin >= 1 && search_lat_bin <= length(lat_bins)-1 && ...
+                           search_lon_bin >= 1 && search_lon_bin <= length(lon_bins)-1
+                            key = sprintf('%d_%d', search_lat_bin, search_lon_bin);
+                            if isKey(grid_map, key)
+                                candidate_indices = [candidate_indices, grid_map(key)];
+                            end
+                        end
+                    end
+                end
+                
+                % 在时间匹配的点和空间候选点的交集中进行精确匹配
+                if ~isempty(candidate_indices)
+                    valid_candidates = intersect(time_matched_idx, candidate_indices);
+                    
+                    if ~isempty(valid_candidates)
+                        % 计算精确距离
+                        lat_diff = abs(surface_lats(valid_candidates) - mwhs_lat);
+                        lon_diff = abs(surface_lons(valid_candidates) - mwhs_lon);
+                        
+                        valid_space_mask = lat_diff <= 0.1 & lon_diff <= 0.1;
+                        valid_matches = valid_candidates(valid_space_mask);
+                        
+                        if ~isempty(valid_matches)
+                            space_match_count = space_match_count + 1;
+                            
+                            % 多匹配时取最小距离
+                            if numel(valid_matches) > 1
+                                if debug_mode && debug_counter < debug_sample_size
+                                    fprintf('  多匹配点: %d 个候选\n', numel(valid_matches));
+                                end
+                                total_diff = lat_diff(valid_space_mask) + lon_diff(valid_space_mask);
+                                [~, min_idx] = min(total_diff);
+                                best_match = valid_matches(min_idx);
+                            else
+                                best_match = valid_matches(1);
+                            end
+                            
+                            match_count = match_count + 1;
+                            temp_bt_idx(match_count) = valid_indices(ii);
+                            temp_surface_idx(match_count) = best_match;
+                            
+                            % 详细调试信息
+                            if sample_debug && debug_counter < debug_sample_size
+                                debug_counter = debug_counter + 1;
+                                fprintf('  匹配成功 #%d:\n', debug_counter);
+                                fprintf('    MWHS位置: (%.3f, %.3f), 时间: %s\n', ...
+                                    mwhs_lat, mwhs_lon, ...
+                                    datestr(mwhs_time/86400 + datenum('1970-01-01')));
+                                fprintf('    Surface位置: (%.3f, %.3f), 时间: %s\n', ...
+                                    surface_lats(best_match), surface_lons(best_match), ...
+                                    datestr(surface_times(best_match)/86400 + datenum('1970-01-01')));
+                                fprintf('    时间差: %.1f分钟, 距离差: lat=%.3f, lon=%.3f\n', ...
+                                    time_diff(best_match)/60, ...
+                                    abs(surface_lats(best_match) - mwhs_lat), ...
+                                    abs(surface_lons(best_match) - mwhs_lon));
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        % 提取实际匹配的索引
+        if match_count > 0
+            bt_index = temp_bt_idx(1:match_count);
+            surface_index = temp_surface_idx(1:match_count);
+        end
+        
+        % 匹配统计报告
+        total_valid_mwhs = size(valid_mwhs_data, 1);
+        fprintf('匹配统计:\n');
+        fprintf('  有效MWHS数据: %d\n', total_valid_mwhs);
+        fprintf('  时间匹配成功: %d (%.1f%%)\n', time_match_count, 100*time_match_count/max(1, total_valid_mwhs));
+        fprintf('  最终匹配成功: %d (%.1f%%)\n', space_match_count, 100*space_match_count/max(1, total_valid_mwhs));
+        
+        %% 保存匹配结果
+        if ~isempty(bt_index)
+            % 创建存储目录
+            save_dir_bt = 'E:\data\fy\30-50_110-130_mwhs\up\4-6\boundary_cloudy';
+            save_dir_surface = 'E:\data\fy\30-50_110-130_mwhs\up\4-6\boundary_cloudy\surface';
+                                 
+            if ~isfolder(save_dir_bt), mkdir(save_dir_bt); end
+            if ~isfolder(save_dir_surface), mkdir(save_dir_surface); end
+            
+            % 构建文件名 (包含日期和时间)
+            save_name = [date_str, '_', time_str];
+            
+            % 保存匹配数据
+            data_match_btd = mwhs_data(bt_index, :);
+            save(fullfile(save_dir_bt, [save_name, '_mwhs.mat']), 'data_match_btd');
+            
+            data_match_s = surface(surface_index, :);
+            save(fullfile(save_dir_surface, [save_name, '_match_surface.mat']), 'data_match_s');
+            
+        end
+        
+        fprintf('Processed %s %s: Matched %d points\n', date_str, time_str, length(bt_index));
+        
+        % 如果没有匹配点，给出可能的原因
+        if isempty(bt_index) && debug_mode
+            fprintf('  可能原因分析:\n');
+            if total_valid_mwhs == 0
+                fprintf('    - 没有满足北纬东经条件的MWHS数据\n');
+            elseif time_match_count == 0
+                fprintf('    - 时间匹配失败：MWHS与ec数据时间差都超过30分钟\n');
+            elseif space_match_count == 0
+                fprintf('    - 空间匹配失败：满足时间条件但距离都超过0.1度\n');
+            end
+        end
+    end
+end
+
+toc
