@@ -1,0 +1,166 @@
+%% 读取全球netcdf数据
+clc
+clear all
+tic
+%% 设置文件夹路径
+dataFolderPath = 'E:\data\ec\pressure\30-50_110-130\4-6\4';
+%% 获取文件夹中所有NetCDF文件
+fileList = dir(fullfile(dataFolderPath, '*.nc'));
+
+% 统计变量
+totalFiles = length(fileList);
+processedFiles = 0;
+skippedFiles = 0;
+errorFiles = 0;
+
+fprintf('找到 %d 个NetCDF文件需要处理\n', totalFiles);
+
+%% 循环读取和保存数据
+for fileIndex = 1:totalFiles
+    %% 生成文件路径
+    filePath = fullfile(dataFolderPath, fileList(fileIndex).name);
+    [~, fileName, ~] = fileparts(filePath);
+    
+    % 生成对应的.mat文件路径
+    saveNameHead = fullfile(dataFolderPath, [fileName, '.mat']);
+    
+    % 检查.mat文件是否已存在
+    if exist(saveNameHead, 'file')
+        fprintf('[%d/%d] 跳过文件: %s (对应的.mat文件已存在)\n', fileIndex, totalFiles, fileList(fileIndex).name);
+        skippedFiles = skippedFiles + 1;
+        continue;
+    end
+    
+    % 尝试读取和处理文件
+    try
+        fprintf('[%d/%d] 开始处理文件: %s\n', fileIndex, totalFiles, fileList(fileIndex).name);
+        
+        data_ecmwf_pressure = []; 
+        ecmwf = [];
+        
+        %% 读取数据
+        lon = double(ncread(filePath, 'longitude'));
+        lat = double(ncread(filePath, 'latitude'));
+        time = double(ncread(filePath, 'valid_time'));
+        rh = double(ncread(filePath, 'r'));
+        shum = double(ncread(filePath, 'q'));
+        tem = double(ncread(filePath, 't'));
+        
+        %% 打印数据维度信息用于调试
+        fprintf('  数据维度 - lon: %d, lat: %d, time: %d\n', length(lon), length(lat), length(time));
+        fprintf('  tem维度: %s, rh维度: %s, shum维度: %s\n', mat2str(size(tem)), mat2str(size(rh)), mat2str(size(shum)));
+        
+        %% 对经度进行转换（如需要）
+        % lon(lon < 0) = lon(lon < 0) + 360.0;
+        
+        %% 获取数据维度
+        lon_size = length(lon);
+        lat_size = length(lat);
+        time_size = length(time);
+        
+        % 数据完整性检查
+        if lon_size == 0 || lat_size == 0 || time_size == 0
+            error('数据维度异常：lon_size=%d, lat_size=%d, time_size=%d', lon_size, lat_size, time_size);
+        end
+        
+        %% 由于数据量太大，耗费时间太长，对数据进行拆分读取
+        k = 1; s = 1;
+        
+        % 计算分组数量，确保不超过lon的实际长度
+        total_groups = 6;
+        if lon_size < 100  % 如果lon维度较小，调整分组策略
+            total_groups = min(total_groups, lon_size);
+        end
+        
+        fprintf('  将数据分为%d组处理\n', total_groups);
+        
+        for n = 1:total_groups
+            % 计算当前组的结束索引
+            if n < total_groups
+                group_size = floor(lon_size / total_groups);
+                p = s + group_size - 1;
+            else
+                p = lon_size;  % 最后一组处理剩余的所有索引
+            end
+            
+            % 确保p不超过lon的长度
+            p = min(p, lon_size);
+            
+            fprintf('  处理第%d组: 从索引%d到%d\n', n, s, p);
+            
+            for i = s:p
+                % 检查索引是否有效
+                if i > lon_size
+                    warning('索引%d超过lon数组长度%d，跳过', i, lon_size);
+                    continue;
+                end
+                
+                for j = 1:lat_size
+                    for m = 1:time_size
+                        ecmwf(k, 1) = time(m);
+                        ecmwf(k, 2) = lon(i);
+                        ecmwf(k, 3) = lat(j);
+                        ecmwf(k, 4:40) = squeeze(tem(i, j, :, m));
+                        ecmwf(k, 41:77) = squeeze(rh(i, j, :, m));
+                        ecmwf(k, 78:114) = 0;
+                        ecmwf(k, 115:151) = 0;
+                        ecmwf(k, 152:188) = 0;
+                        ecmwf(k, 189:225) = squeeze(shum(i, j, :, m));
+                        ecmwf(k, 226:262) = 0;
+                        k = k + 1;
+                    end
+                end
+                
+                % 每处理10个经度索引显示一次进度
+                if mod(i-s+1, 10) == 0 || i == p
+                    fprintf('    完成经度索引: %d/%d\n', i-s+1, p-s+1);
+                end
+            end
+            
+            % 将当前组的数据添加到总数据中
+            data_ecmwf_pressure = [data_ecmwf_pressure; ecmwf];
+            
+            % 重置变量准备下一组
+            ecmwf = [];
+            k = 1;
+            s = p + 1;
+            
+            % 如果已经处理完所有数据，退出循环
+            if s > lon_size
+                break;
+            end
+        end
+        
+        %% 保存数据
+        fprintf('  正在保存数据到: %s\n', saveNameHead);
+        save(saveNameHead, 'data_ecmwf_pressure');
+        fprintf('  ✓ 成功处理并保存文件: %s\n', fileName);
+        processedFiles = processedFiles + 1;
+        
+    catch ME
+        % 捕获并处理错误
+        fprintf('  ✗ 处理文件失败: %s\n', fileList(fileIndex).name);
+        fprintf('    错误信息: %s\n', ME.message);
+        
+        % 如果是文件读取错误，给出更具体的提示
+        if contains(ME.message, 'NetCDF') || contains(ME.message, 'ncread')
+            fprintf('    可能原因: NetCDF文件损坏或格式不正确\n');
+        elseif contains(ME.message, '维度')
+            fprintf('    可能原因: 数据维度异常\n');
+        end
+        
+        errorFiles = errorFiles + 1;
+        continue;  % 继续处理下一个文件
+    end
+end
+
+%% 处理完成统计
+fprintf('\n=== 处理完成统计 ===\n');
+fprintf('总文件数: %d\n', totalFiles);
+fprintf('成功处理: %d\n', processedFiles);
+fprintf('跳过文件: %d (已存在.mat文件)\n', skippedFiles);
+fprintf('错误文件: %d\n', errorFiles);
+fprintf('处理成功率: %.1f%%\n', (processedFiles/(totalFiles-skippedFiles))*100);
+
+toc
+fprintf('总用时: %.2f 秒\n', toc);rrr
