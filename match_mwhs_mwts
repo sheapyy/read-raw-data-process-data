@@ -1,0 +1,267 @@
+clc
+clear all
+tic
+
+%% 日期范围设置
+start_date = '20250501';
+end_date = '20250630';
+date_list = datenum(start_date, 'yyyymmdd'):datenum(end_date, 'yyyymmdd');
+date_list = datestr(date_list, 'yyyymmdd');
+
+%% 主循环处理每天数据
+for d_idx = 1:size(date_list, 1)
+    date_str = strtrim(date_list(d_idx, :));  % 当前日期
+    
+    %% ========== 1. 获取卫星数据文件列表 ==========
+    mwts_path = 'E:\data\fy\30-50_110-130_mwts\4-6\boundary_cloudy';
+    mwhs_path = 'E:\data\fy\30-50_110-130_mwhs\up\4-6\boundary_cloudy';
+    pressure_path = 'E:\data\fy\30-50_110-130_mwts\4-6\boundary_cloudy\pressure';
+    
+    mwts_files = dir(fullfile(mwts_path, '*.mat'));
+    mwhs_files = dir(fullfile(mwhs_path, '*.mat'));
+    pressure_files = dir(fullfile(pressure_path, '*.mat'));
+    
+    % 检查有效文件
+    if isempty(mwts_files) || isempty(mwhs_files) || isempty(pressure_files)
+        warning('未找到必要文件: %s', date_str);
+        continue;
+    end
+    
+    %% ========== 2. 基于文件名日期匹配同一天的数据 ==========
+    for f_idx = 1:length(mwts_files)
+        mwts_fname = mwts_files(f_idx).name;
+        
+        % 从MWTS文件名提取日期和时间信息
+        mwts_parts = split(mwts_fname, '_');
+        if length(mwts_parts) < 2
+            fprintf('MWTS文件名格式不正确: %s\n', mwts_fname);
+            continue;
+        end
+        mwts_date = mwts_parts{1};
+        mwts_time = mwts_parts{2};
+        
+        % 查找匹配文件
+        [mwhs_fname, pressure_fname] = findMatchingFiles(mwhs_files, pressure_files, mwts_date, mwts_time);
+        
+        if isempty(mwhs_fname) || isempty(pressure_fname)
+            fprintf('未找到匹配文件 (日期: %s, 时间: %s)\n', mwts_date, mwts_time);
+            continue;
+        end
+        
+        %% ========== 3. 加载配对的数据文件 ==========
+        try
+            mwts_data = loadDataFile(fullfile(mwts_path, mwts_fname));
+            mwhs_data = loadDataFile(fullfile(mwhs_path, mwhs_fname));
+            pressure_data = loadDataFile(fullfile(pressure_path, pressure_fname));
+        catch ME
+            fprintf('数据加载失败: %s\n', ME.message);
+            continue;
+        end
+        
+        % 检查数据有效性
+        if isempty(mwts_data) || isempty(mwhs_data) || isempty(pressure_data)
+            fprintf('数据为空: %s\n', mwts_fname);
+            continue;
+        end
+        
+        if size(mwts_data, 1) ~= size(pressure_data, 1)
+            fprintf('MWTS与pressure数据行数不匹配\n');
+            continue;
+        end
+        
+        %% ========== 4. 优化的时空匹配 ==========
+        fprintf('开始匹配 %s 和 %s...\n', mwts_fname, mwhs_fname);
+        
+        % 预处理：筛选有效数据
+        mwts_valid = filterValidData(mwts_data);
+        mwhs_valid = filterValidData(mwhs_data);
+        
+        if sum(mwts_valid) == 0 || sum(mwhs_valid) == 0
+            fprintf('没有有效数据点\n');
+            continue;
+        end
+        
+        % 使用优化匹配算法
+        [mwts_index, mwhs_index] = optimizedMatching(mwts_data(mwts_valid, :), ...
+                                                     mwhs_data(mwhs_valid, :), ...
+                                                     find(mwts_valid), find(mwhs_valid));
+        
+        %% ========== 5. 保存匹配结果 ==========
+        if ~isempty(mwts_index)
+            saveMatchedData(mwts_data, mwhs_data, pressure_data, ...
+                           mwts_index, mwhs_index, mwts_date, mwts_time);
+            
+            fprintf('成功处理 %s_%s: 匹配了 %d 个点\n', ...
+                    mwts_date, mwts_time, length(mwts_index));
+        else
+            fprintf('未找到匹配点: %s_%s\n', mwts_date, mwts_time);
+        end
+    end
+    
+    fprintf('完成日期 %s 的处理\n', date_str);
+end
+
+fprintf('\n所有数据处理完成！\n');
+toc
+
+%% ========== 辅助函数 ==========
+
+function [mwhs_fname, pressure_fname] = findMatchingFiles(mwhs_files, pressure_files, target_date, target_time)
+    mwhs_fname = '';
+    pressure_fname = '';
+    
+    % 查找MWHS文件
+    for i = 1:length(mwhs_files)
+        parts = split(mwhs_files(i).name, '_');
+        if length(parts) >= 2 && strcmp(parts{1}, target_date) && strcmp(parts{2}, target_time)
+            mwhs_fname = mwhs_files(i).name;
+            break;
+        end
+    end
+    
+    % 查找pressure文件
+    for i = 1:length(pressure_files)
+        parts = split(pressure_files(i).name, '_');
+        if length(parts) >= 2 && strcmp(parts{1}, target_date) && strcmp(parts{2}, target_time)
+            pressure_fname = pressure_files(i).name;
+            break;
+        end
+    end
+end
+
+function data = loadDataFile(filepath)
+    file_data = load(filepath);
+    data = [];
+    
+    % 按优先级尝试不同字段名
+    field_priority = {'matched_data', 'data_match_btd', 'pressure_data'};
+    
+    for i = 1:length(field_priority)
+        if isfield(file_data, field_priority{i})
+            data = file_data.(field_priority{i});
+            return;
+        end
+    end
+    
+    % 如果没找到预期字段，寻找数值型字段
+    field_names = fieldnames(file_data);
+    for i = 1:length(field_names)
+        temp_data = file_data.(field_names{i});
+        if isnumeric(temp_data) && size(temp_data, 2) >= 14
+            data = temp_data;
+            return;
+        end
+    end
+end
+
+function valid_mask = filterValidData(data)
+    % 筛选有效数据：经度>0，纬度>0，时间字段不为NaN
+    valid_mask = data(:, 14) > 0 & data(:, 15) > 0 & ...
+                 ~isnan(data(:, 1)) & ~isnan(data(:, 2)) & ~isnan(data(:, 3)) & ...
+                 ~isnan(data(:, 4)) & ~isnan(data(:, 5)) & ~isnan(data(:, 6));
+end
+
+function [mwts_indices, mwhs_indices] = optimizedMatching(mwts_data, mwhs_data, mwts_orig_idx, mwhs_orig_idx)
+    mwts_indices = [];
+    mwhs_indices = [];
+    
+    % 参数设置
+    TIME_THRESHOLD = 5;      % 时间差阈值（秒）
+    LAT_THRESHOLD = 0.05;    % 纬度差阈值（度）
+    LON_THRESHOLD = 0.05;    % 经度差阈值（度）
+    
+    % 预计算时间戳
+    mwts_times = computeTimestamps(mwts_data);
+    mwhs_times = computeTimestamps(mwhs_data);
+    
+    if isempty(mwts_times) || isempty(mwhs_times)
+        return;
+    end
+    
+    % 提取经纬度
+    mwts_lats = mwts_data(:, 15);
+    mwts_lons = mwts_data(:, 14);
+    mwhs_lats = mwhs_data(:, 15);
+    mwhs_lons = mwhs_data(:, 14);
+    
+    % 使用向量化操作进行批量匹配
+    used_mwhs = false(size(mwhs_data, 1), 1);  % 标记已使用的MWHS点
+    
+    for i = 1:size(mwts_data, 1)
+        if mod(i, 100) == 0
+            fprintf('处理进度: %d/%d\n', i, size(mwts_data, 1));
+        end
+        
+        % 计算与所有MWHS点的时间差
+        time_diffs = abs(mwts_times(i) - mwhs_times);
+        
+        % 计算与所有MWHS点的经纬度差
+        lat_diffs = abs(mwts_lats(i) - mwhs_lats);
+        lon_diffs = abs(mwts_lons(i) - mwhs_lons);
+        
+        % 找到满足所有条件的候选点
+        candidates = find(~used_mwhs & ...
+                         time_diffs <= TIME_THRESHOLD & ...
+                         lat_diffs <= LAT_THRESHOLD & ...
+                         lon_diffs <= LON_THRESHOLD);
+        
+        if ~isempty(candidates)
+            % 计算综合距离并选择最佳匹配
+            total_distances = time_diffs(candidates) + lat_diffs(candidates) + lon_diffs(candidates);
+            [~, best_idx] = min(total_distances);
+            best_match = candidates(best_idx);
+            
+            % 记录匹配结果
+            mwts_indices(end+1) = mwts_orig_idx(i);
+            mwhs_indices(end+1) = mwhs_orig_idx(best_match);
+            used_mwhs(best_match) = true;  % 标记为已使用
+        end
+    end
+end
+
+function timestamps = computeTimestamps(data)
+    timestamps = [];
+    try
+        % 处理毫秒字段（如果存在）
+        if size(data, 2) >= 7 && ~all(isnan(data(:, 7)))
+            seconds_with_ms = data(:, 6) + data(:, 7) / 1000;
+        else
+            seconds_with_ms = data(:, 6);
+        end
+        
+        % 批量计算时间戳
+        dt_array = datetime(data(:, 1), data(:, 2), data(:, 3), ...
+                           data(:, 4), data(:, 5), seconds_with_ms);
+        timestamps = posixtime(dt_array);
+    catch ME
+        fprintf('时间戳计算失败: %s\n', ME.message);
+    end
+end
+
+function saveMatchedData(mwts_data, mwhs_data, pressure_data, mwts_index, mwhs_index, date_str, time_str)
+    % 创建保存目录
+    save_dirs = {
+        'E:\data\fy\30-50_110-130_mwts\4-6\boundary_cloudy\matched_with_mwhs',
+        'E:\data\fy\30-50_110-130_mwhs\up\4-6\boundary_cloudy\matched_with_mwts',
+        'E:\data\fy\30-50_110-130_mwts\4-6\boundary_cloudy\pressure\final'
+    };
+    
+    for i = 1:length(save_dirs)
+        if ~isfolder(save_dirs{i})
+            mkdir(save_dirs{i});
+        end
+    end
+    
+    % 提取匹配数据
+    data_match_mwts = mwts_data(mwts_index, :);
+    data_match_mwhs = mwhs_data(mwhs_index, :);
+    data_match_pressure = pressure_data(mwts_index, :);
+    
+    % 构建文件名
+    save_name = [date_str, '_', time_str];
+    
+    % 保存文件
+    save(fullfile(save_dirs{1}, [save_name, '_match_mwts.mat']), 'data_match_mwts');
+    save(fullfile(save_dirs{2}, [save_name, '_match_mwhs.mat']), 'data_match_mwhs');
+    save(fullfile(save_dirs{3}, [save_name, '_match_pressure.mat']), 'data_match_pressure');
+end
